@@ -12,3 +12,4 @@ dependencies = [
 [[package]]
 name = "elf-loader"
 version = "0.1.0"
+source = "git+https://github.com/nightloewe1/elf-loader#b237933d473dc4478360de0b1f967fb6488a234a"
