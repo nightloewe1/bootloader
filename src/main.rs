@@ -100,16 +100,18 @@ fn main(handle: EfiHandle, system_table: *const SystemTable) {
         )
         .as_str(),
     );
-    fb.draw_offset(10000, 100000, 0xFF11FF);
     //Load kernel data from /kernel.elf
-    //let kernel_data = load_kernel(handle, st).expect("Unable to load kernel");
-    //let kernel_file = ElfFile::from(kernel_data);
+    let kernel_data = load_kernel(handle, st).expect("Unable to load kernel");
+    let kernel_file = ElfFile::from(kernel_data);
 
-    //let data_sl = unsafe { slice::from_raw_parts(kernel_file.data(), kernel_file.len()) };
+    let data_sl = unsafe { slice::from_raw_parts(kernel_file.data(), kernel_file.len()) };
 
-    // if !kernel_file.verify_magic() {
-    //     panic!("Can not load kernel: File is corrupted, it is not of type ELF\r\nKernel Length: {:?}", kernel_file.len())
-    // }
+    if !kernel_file.verify_magic() {
+        panic!(
+            "Can not load kernel: File is corrupted, it is not of type ELF\r\nKernel Length: {:?}",
+            kernel_file.len()
+        )
+    }
 
     // //Load the main function into variable
     // let kernel_main: unsafe extern fn(*const KernelArgs) = unsafe { mem::transmute(kernel_file.entry_point_ptr() as *const (*const KernelArgs)) };
@@ -180,6 +182,7 @@ fn main(handle: EfiHandle, system_table: *const SystemTable) {
     // unsafe {
     //     kernel_main(&kargs);
     // }
+    loop {}
 }
 
 #[allow(unsafe_code)]
@@ -188,45 +191,72 @@ pub fn load_kernel(handle: EfiHandle, st: &SystemTable) -> Result<Vec<u8>, EfiSt
     logger.log("NightOS Bootloader (v0.0.1)\r\n");
 
     logger.log("Loading kernel from /kernel.elf\r\n");
-    // let loaded_image_result = st.boot_services().open_protocol::<LoadedImage>(handle, LOADED_IMAGE_GUID, handle);
-    // if loaded_image_result.is_err() {
-    //     panic!("Unable to open LoadedImage protocol: {}", loaded_image_result.unwrap_err());
-    // }
-    // let loaded_image = loaded_image_result.unwrap();
-    //
-    // let sfp_result = unsafe { st.boot_services().open_protocol::<SimpleFileSystem>((*loaded_image).device_handle, SIMPLE_FILE_SYSTEM_GUID, (*loaded_image).device_handle) };
-    // if sfp_result.is_err() {
-    //     panic!("Unable to open SimpleFileSystem protocol: {}", sfp_result.unwrap_err());
-    // }
-    // let sfp = sfp_result.unwrap();
-    //
-    // let root = unsafe { (*sfp).open_volume().expect("Unable to open volume due to error") };
-    //
-    // let file = unsafe { (*root).open("kernel.elf", 1, 0).expect("Unable to open file") };
-    // let file_size = unsafe { (*file).file_size() };
-    //
-    // let mut buffer: Vec<u8> = Vec::new();
-    // buffer.resize(1025, 0);
-    // let mut buffer_size = buffer.capacity();
-    //
-    // logger.log(format!("Buffer size: {}\r\n", buffer_size).as_str());
-    //
-    // unsafe {
-    //     let status = (*file).read_chunked(256, &mut buffer);
-    //     //buffer[1536] = 123u8;
-    //
-    //     logger.log(format!("Buffer: {:X?}\r\n", &buffer.as_slice()[0..4]).as_str());
-    //
-    // //     if status == 0 {
-    // //         logger.log(format!("File read bytes: {:?} Revision: {:?} Size: {:?}\r\n", buffer_size, (*file).revision, file_size).as_str());
-    // //         Ok(buffer)
-    // //     } else {
-    // //         logger.log("File: ERR\r\n");
-    // //         Err(status)
-    // //     }
-    //     return Err(0)
-    // }
-    return Err(0);
+    let loaded_image_result =
+        st.boot_services()
+            .open_protocol::<LoadedImage>(handle, LOADED_IMAGE_GUID, handle);
+    if loaded_image_result.is_err() {
+        panic!(
+            "Unable to open LoadedImage protocol: {}",
+            loaded_image_result.unwrap_err()
+        );
+    }
+    let loaded_image = loaded_image_result.unwrap();
+
+    let sfp_result = unsafe {
+        st.boot_services().open_protocol::<SimpleFileSystem>(
+            (*loaded_image).device_handle,
+            SIMPLE_FILE_SYSTEM_GUID,
+            (*loaded_image).device_handle,
+        )
+    };
+    if sfp_result.is_err() {
+        panic!(
+            "Unable to open SimpleFileSystem protocol: {}",
+            sfp_result.unwrap_err()
+        );
+    }
+    let sfp = sfp_result.unwrap();
+
+    let root = unsafe {
+        (*sfp)
+            .open_volume()
+            .expect("Unable to open volume due to error")
+    };
+
+    let file = unsafe {
+        (*root)
+            .open("kernel.elf", 1, 0)
+            .expect("Unable to open file")
+    };
+    let file_size = unsafe { (*file).file_size() };
+
+    let mut buffer: Vec<u8> = Vec::new();
+    buffer.resize(file_size as usize, 0);
+    let mut buffer_size = buffer.capacity();
+
+    logger.log(format!("Buffer size: {}\r\n", buffer_size).as_str());
+
+    unsafe {
+        let status = (*file).read_chunked(256, &mut buffer);
+
+        logger.log(format!("Buffer: {:X?}\r\n", &buffer.as_slice()[0..4]).as_str());
+
+        if status == 0 {
+            logger.log(
+                format!(
+                    "File read bytes: {:?} Revision: {:?} Size: {:?}\r\n",
+                    buffer_size,
+                    (*file).revision,
+                    file_size
+                )
+                .as_str(),
+            );
+            Ok(buffer)
+        } else {
+            logger.log("File: ERR\r\n");
+            Err(status)
+        }
+    }
 }
 
 #[allow(unsafe_code)]

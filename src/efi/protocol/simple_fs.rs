@@ -1,6 +1,5 @@
 use crate::efi::{Char16, EfiGuid, EfiStatus};
 use alloc::vec::Vec;
-use core::ops::AddAssign;
 use core::ptr::null_mut;
 pub const SIMPLE_FILE_SYSTEM_GUID: EfiGuid = EfiGuid::new(
     0x964E5B22,
@@ -55,7 +54,7 @@ pub struct EfiFile {
     close: unsafe extern "efiapi" fn(this: *const EfiFile) -> EfiStatus,
     delete: unsafe extern "efiapi" fn(this: *const EfiFile) -> EfiStatus,
     read: unsafe extern "efiapi" fn(
-        this: *const EfiFile,
+        this: *mut EfiFile,
         buffer_size: *mut u64,
         buffer: *mut u8,
     ) -> EfiStatus,
@@ -90,10 +89,11 @@ impl EfiFile {
     ) -> Result<*mut EfiFile, EfiStatus> {
         let mut file = null_mut();
 
-        let mut vec = Vec::with_capacity(file_name.len());
+        let mut vec = Vec::new();
         for c in file_name.encode_utf16() {
             vec.push(c);
         }
+        vec.push(0);
 
         unsafe {
             let status = (self.open)(self, file, vec.as_mut_ptr(), open_mode, attributes);
@@ -117,11 +117,11 @@ impl EfiFile {
         unsafe { *(data.as_ptr() as *const u64).offset(1) }
     }
 
-    pub fn read(&self, buffer_size: *mut u64, buffer: *mut u8) -> EfiStatus {
+    pub fn read(&mut self, buffer_size: *mut u64, buffer: *mut u8) -> EfiStatus {
         unsafe { (self.read)(self, buffer_size, buffer) }
     }
 
-    pub fn read_chunked(&self, chunk_size: usize, buffer: &mut [u8]) -> EfiStatus {
+    pub fn read_chunked(&mut self, chunk_size: usize, buffer: &mut [u8]) -> EfiStatus {
         let len = buffer.len() - 1;
         let iter = len / chunk_size;
         let mut buf_size = chunk_size as u64;

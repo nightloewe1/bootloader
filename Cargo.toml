@@ -13,6 +13,4 @@ name = "bootx64"
 path = "src/main.rs"
 
 [profile.dev]
-debug = 2
-split-debuginfo = "off"
-strip = "none"
+panic = "abort"

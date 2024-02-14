@@ -25,7 +25,7 @@ unsafe impl GlobalAlloc for EfiAllocator {
         let mut ptr = null_mut();
         st.unwrap().boot_services().allocate_pool(
             EfiMemoryType::EFI_LOADER_DATA,
-            layout.align() as u64,
+            layout.size() as u64,
             &mut ptr,
         );
 
