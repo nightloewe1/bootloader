@@ -16,5 +16,9 @@ jobs:
 
     steps:
     - uses: actions/checkout@v3
+    - uses: actions/checkout@v3
+      with:
+        repository: nightloewe1/elf-loader
+        path: main
     - name: Build
       run: cargo build --verbose
