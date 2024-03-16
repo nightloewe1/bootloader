@@ -37,7 +37,7 @@ static mut LOGGER: Option<*mut EfiLogger> = None;
 
 #[allow(unsafe_code)]
 #[export_name = "efi_main"]
-fn main(handle: EfiHandle, system_table: *const SystemTable) {
+fn main(handle: EfiHandle, system_table: *const SystemTable) -> u64 {
     //Set allocator
     unsafe {
         ALLOC = EfiAllocator::new(system_table);
@@ -151,7 +151,10 @@ fn main(handle: EfiHandle, system_table: *const SystemTable) {
     };
 
     //We need the memory map for our kernel
-    let (memory_map, map_key) = get_memory_map(handle, st).unwrap();
+    let exit_result = get_memory_map(handle, st);
+    if exit_result.is_err() {
+        return exit_result.unwrap_err();
+    }
 
     // kargs.memory_map = memory_map.as_ptr() as *const u8;
     // kargs.memory_map_size = memory_map.len() as u64;
@@ -321,10 +324,13 @@ pub fn get_memory_map(
 
     //Now we need to exit the UEFI boot services and call the kernel main to hand over control
     let exit_status = st.boot_services().exit_boot_services(handle, map_key);
-    unsafe { (*LOGGER.unwrap()).log(format!("Exit Status: {}", exit_status).as_str()) }
-    // if exit_status != 0 {
-    //     return Err(exit_status);
-    // }
+    unsafe {
+        ALLOC = EfiAllocator::new(null());
+        (*LOGGER.unwrap()).log(format!("Exit Status: {}", exit_status).as_str());
+    }
+    if exit_status != 0 {
+        return Err(exit_status);
+    }
 
     // unsafe {
     //     for i in 0..map_len as usize {
