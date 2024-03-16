@@ -1,3 +1,4 @@
+use core::fmt::Write;
 use core::slice;
 
 pub trait Logger {
@@ -19,6 +20,7 @@ pub trait Logger {
     }
 }
 
+#[repr(C)]
 #[derive(Copy, Clone, Debug)]
 pub struct FrameBufferInfo {
     pub address: usize,

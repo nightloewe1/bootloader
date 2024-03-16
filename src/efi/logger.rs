@@ -1,4 +1,5 @@
 use crate::common::log::{FrameBuffer, Logger};
+use core::fmt::Write;
 
 const FONT: &[u8] = include_bytes!("../../resources/uni.psf");
 
@@ -40,7 +41,8 @@ impl Logger for EfiLogger {
                 let pos_char = self.pos_x / 8;
 
                 if pos_char >= self.chars_per_line {
-                    //Truncate overflow
+                    self.pos_y += 16;
+                    self.pos_x = 0;
                     return;
                 }
 
@@ -67,5 +69,11 @@ impl Logger for EfiLogger {
                 self.pos_x += 8
             }
         }
+    }
+}
+
+impl Write for EfiLogger {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        Ok(self.log(s))
     }
 }

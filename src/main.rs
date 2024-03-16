@@ -12,10 +12,7 @@ use crate::efi::loaded_image::{LoadedImage, LOADED_IMAGE_GUID};
 use crate::efi::logger::EfiLogger;
 use crate::efi::simple_fs::{EfiFile, SimpleFileSystem, SIMPLE_FILE_SYSTEM_GUID};
 use crate::efi::SystemTable;
-use crate::efi::{
-    format_efi_status, EfiHandle, EfiMemoryDescriptor, EfiMemoryType, EfiStatus, ALLOCATE_ANY_PAGES,
-};
-use alloc::fmt::format;
+use crate::efi::{format_efi_status, EfiHandle, EfiMemoryDescriptor, EfiStatus};
 use alloc::format;
 use alloc::string::ToString;
 use alloc::vec::Vec;
@@ -34,6 +31,11 @@ mod efi;
 static mut ALLOC: EfiAllocator = EfiAllocator::new(null());
 
 static mut LOGGER: Option<*mut EfiLogger> = None;
+
+#[allow(unsafe_code)]
+fn logger() -> &'static mut EfiLogger {
+    unsafe { &mut *LOGGER.unwrap() }
+}
 
 #[allow(unsafe_code)]
 #[export_name = "efi_main"]
@@ -94,13 +96,12 @@ fn main(handle: EfiHandle, system_table: *const SystemTable) -> u64 {
         LOGGER = Some(&mut logger);
     }
 
-    logger.log(
-        format!(
-            "EfiLogger initialized, using framebuffer at {:X}\r\n",
-            framebuffer.address
-        )
-        .as_str(),
-    );
+    writeln!(
+        logger,
+        "EfiLogger initialized, using framebuffer at {:X}\r",
+        framebuffer.address
+    )
+    .unwrap();
     //Load kernel data from /kernel.elf
     let kernel_data = load_kernel(handle, st).expect("Unable to load kernel");
     let kernel_file = ElfFile::from(kernel_data);
@@ -114,7 +115,7 @@ fn main(handle: EfiHandle, system_table: *const SystemTable) -> u64 {
     }
 
     //Load the main function into variable
-    let kernel_main: unsafe extern "C" fn(*const KernelArgs) =
+    let kernel_main: unsafe extern "C" fn(*const KernelArgs) -> u64 =
         unsafe { mem::transmute(kernel_file.entry_point_ptr() as *const (*const KernelArgs)) };
 
     kernel_file
@@ -125,16 +126,17 @@ fn main(handle: EfiHandle, system_table: *const SystemTable) -> u64 {
             let offset = h.offset;
             let v_addr = h.v_addr;
             let mem_size = h.memory_size;
-            logger.log(
-                format!(
-                    "Abs: {:#016X} - V: {:#016X} - {:8} Bytes\r\n",
-                    kernel_file.data() as u64 + offset,
-                    v_addr,
-                    mem_size
-                )
-                .as_str(),
-            );
+            writeln!(
+                logger,
+                "Abs: {:#016X} - V: {:#016X} - {:8} Bytes\r",
+                kernel_file.data() as u64 + offset,
+                v_addr,
+                mem_size
+            )
+            .unwrap();
         });
+
+    let headers = kernel_file.program_headers();
 
     //Prepare page table
     //let page_table = init_page_table(&kernel_file);
@@ -151,35 +153,38 @@ fn main(handle: EfiHandle, system_table: *const SystemTable) -> u64 {
     };
 
     //We need the memory map for our kernel
-    let exit_result = get_memory_map(handle, st);
-    if exit_result.is_err() {
-        return exit_result.unwrap_err();
-    }
+    let memory_map = exit_boot_services(handle, st).unwrap();
 
-    // kargs.memory_map = memory_map.as_ptr() as *const u8;
-    // kargs.memory_map_size = memory_map.len() as u64;
-    // kargs.memory_map_type = MemoryMapType::UEFI;
-    //
-    // logger.log(format!("Memory map is at: {:X} - Map Key is {:#X}\r\n", kargs.memory_map as usize, map_key).as_str());
-    //
+    kargs.memory_map = memory_map.as_ptr() as *const u8;
+    kargs.memory_map_size = memory_map.len() as u64;
+    kargs.memory_map_type = MemoryMapType::UEFI;
+
+    writeln!(
+        logger,
+        "Memory map is at: {:X}\r",
+        kargs.memory_map as usize
+    )
+    .expect("");
+
     // for i in 0..memory_map.len() {
     //     let entry = memory_map.get(i);
     //
     //     if entry.is_some() {
     //         let entry = entry.unwrap();
     //
-    //         logger.log(format!("{}\r\n", entry).as_str());
+    //         writeln!(logger, "{}\r", entry).unwrap();
     //     }
     // }
 
-    //Disable EFI Allocator as kernel will manage memory from now
-    unsafe {
-        ALLOC = EfiAllocator::new(null());
-        LOGGER = None
-    }
+    writeln!(
+        logger,
+        "KArgs address: {:X}\r",
+        &kargs as *const KernelArgs as u64
+    )
+    .unwrap();
 
     //Write the kernel to 0x0 in physical memory
-    //allocate_kernel(&kernel_file, &program_headers);
+    allocate_kernel(&kernel_file, &headers);
 
     //Set page table
     // unsafe {
@@ -188,20 +193,10 @@ fn main(handle: EfiHandle, system_table: *const SystemTable) -> u64 {
     //         in(reg) page_table.as_ptr());
     // }
 
-    // //Call kernel
-    // OPTION 1:
-    // unsafe {
-    //     asm!(r#"
-    //     mov rdi, {0}
-    //     jmp {1}
-    //     "#,
-    //     in(reg) &kargs,
-    //     in(reg) kernel_main);
-    // }
-    // OPTION 2:
     unsafe {
         //logger.log("Passing control to kernel");
-        //kernel_main(&kargs);
+        let returnval = kernel_main(&kargs as *const KernelArgs);
+        writeln!(logger, "Kernel returned: {:X}\r", returnval).unwrap();
     }
     loop {}
 }
@@ -209,9 +204,9 @@ fn main(handle: EfiHandle, system_table: *const SystemTable) -> u64 {
 #[allow(unsafe_code)]
 pub fn load_kernel(handle: EfiHandle, st: &SystemTable) -> Result<Vec<u8>, EfiStatus> {
     let mut logger = unsafe { &mut *LOGGER.unwrap() };
-    logger.log("NightOS Bootloader (v0.0.1)\r\n");
+    //logger.log("NightOS Bootloader (v0.0.1)\r\n");
 
-    logger.log("Loading kernel from /kernel.elf\r\n");
+    //logger.log("Loading kernel from /kernel.elf\r\n");
     let loaded_image_result =
         st.boot_services()
             .open_protocol::<LoadedImage>(handle, LOADED_IMAGE_GUID, handle);
@@ -268,32 +263,39 @@ pub fn load_kernel(handle: EfiHandle, st: &SystemTable) -> Result<Vec<u8>, EfiSt
 
 #[allow(unsafe_code)]
 pub fn allocate_kernel(file: &ElfFile, headers: &[ProgramHeader]) {
-    let logger = unsafe { &mut *LOGGER.unwrap() };
+    let logger = logger();
     let file_data = unsafe { slice::from_raw_parts(file.data(), file.len()) };
 
     //Copy the kernel file to start of physical memory
     for header in headers {
-        // let start = header.v_addr as usize;
-        // let mut ptr = start as *mut u8;
-        // let start_file = header.offset as usize;
-        // let len = start_file + header.memory_size as usize;
+        let start = header.v_addr as usize;
 
-        // logger.log(format!("Copy file {:#016X} to memory {:#016X}", start_file, start).as_str());
-        //
-        // for i in start_file..len {
-        //     unsafe {
-        //         *ptr = file_data[i];
-        //         ptr = ptr.add(1);
-        //     }
-        // }
+        let mut ptr = start as *mut u8;
+        let start_file = header.offset as usize;
+        let end_file = start_file + header.memory_size as usize;
+
+        //writeln!(logger, "Copy file {:#016X} to memory {:#016X}\r", start_file, start).unwrap();
+
+        for i in start_file..end_file {
+            unsafe {
+                *ptr = file_data[i];
+                ptr = ptr.add(1);
+            }
+        }
+
+        ptr = start as *mut u8;
+
+        //unsafe { writeln!(logger, "File {:#016X} = Memory {:#016X}\r", file_data[start_file], *ptr).unwrap(); }
     }
 }
 
 #[allow(unsafe_code)]
-pub fn get_memory_map(
+pub fn exit_boot_services(
     handle: EfiHandle,
     st: &SystemTable,
-) -> Result<(Vec<EfiMemoryDescriptor>, u64), EfiStatus> {
+) -> Result<Vec<EfiMemoryDescriptor>, EfiStatus> {
+    let logger = logger();
+
     let mut bytes: Vec<u8> = Vec::new();
     let mut map_size_bytes = 0u64;
     let mut map_key = 0u64;
@@ -324,31 +326,31 @@ pub fn get_memory_map(
 
     //Now we need to exit the UEFI boot services and call the kernel main to hand over control
     let exit_status = st.boot_services().exit_boot_services(handle, map_key);
+
+    //Disable EFI Allocator as kernel will manage memory from now
     unsafe {
         ALLOC = EfiAllocator::new(null());
-        (*LOGGER.unwrap()).log(format!("Exit Status: {}", exit_status).as_str());
-    }
-    if exit_status != 0 {
-        return Err(exit_status);
+        writeln!(*LOGGER.unwrap(), "Exiting Boot Services: {}\r", exit_status).expect("");
     }
 
-    // unsafe {
-    //     for i in 0..map_len as usize {
-    //         let pos = i * desc_size as usize;
-    //         let pos_end = pos + desc_size as usize;
-    //         let data = &bytes[pos..pos_end];
-    //
-    //         let descriptor = data.as_ptr() as *const EfiMemoryDescriptor;
-    //         let descriptor_ref = &*descriptor;
-    //
-    //         //(*LOGGER.unwrap()).log(format!("D! {}\r\n", *descriptor).as_str());
-    //
-    //         map.push(*descriptor_ref);
-    //         //(*LOGGER.unwrap()).log(format!("D3! {}\r\n", map.get(i).unwrap()).as_str());
-    //     }
-    // }
+    //Add the descriptors to the correctly aligned map
+    unsafe {
+        for i in 0..map_len as usize {
+            let pos = i * desc_size as usize;
+            let pos_end = pos + desc_size as usize;
+            let data = &bytes[pos..pos_end];
 
-    return Ok((map, map_key));
+            let descriptor = data.as_ptr() as *const EfiMemoryDescriptor;
+            let descriptor_ref = &*descriptor;
+
+            //(*LOGGER.unwrap()).log(format!("D! {}\r\n", *descriptor).as_str());
+
+            map.push(*descriptor_ref);
+            //(*LOGGER.unwrap()).log(format!("D3! {}\r\n", map.get(i).unwrap()).as_str());
+        }
+    }
+
+    return Ok(map);
 }
 
 #[allow(unsafe_code)]
@@ -402,9 +404,12 @@ pub fn init_page_table(kernel: &ElfFile) -> Vec<PageMapTable> {
             header.memory_size / 0x1000 + 1
         };
 
+        // Pages are 4 KB in size, so we need to convert v_addr into page index
+        let page_start = header.v_addr / 4096;
+
         for page in 0..pages {
             page_maps.insert(
-                (1536 + header.v_addr + page) as usize,
+                (1536 + page_start + page) as usize,
                 PageMapTableBuilder::from(0u64)
                     .address(header.p_addr + page * 0x1000)
                     .present(true)
@@ -439,8 +444,6 @@ fn panic(info: &PanicInfo) -> ! {
     }
     loop {}
 }
-
-pub type KernelMain = unsafe extern "C" fn(args: u64);
 
 struct MemoryMapType;
 
