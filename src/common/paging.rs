@@ -1,4 +1,5 @@
 #[repr(transparent)]
+#[derive(Debug, Clone)]
 pub struct PageMapTable(u64);
 
 impl PageMapTable {

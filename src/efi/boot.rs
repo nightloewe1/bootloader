@@ -75,7 +75,7 @@ pub struct BootServices {
     ) -> EfiStatus,
     exit: unsafe extern "efiapi" fn() -> EfiStatus,
     unload_image: unsafe extern "efiapi" fn() -> EfiStatus,
-    exit_boot_services: unsafe extern "efiapi" fn(handle: EfiHandle, map_key: u64) -> EfiStatus,
+    exit_boot_services: unsafe extern "efiapi" fn(handle: EfiHandle, map_key: usize) -> EfiStatus,
 
     get_next_monotonic_count: unsafe extern "efiapi" fn() -> EfiStatus,
     stall: unsafe extern "efiapi" fn() -> EfiStatus,
@@ -144,6 +144,7 @@ impl BootServices {
         unsafe { (self.free_pool)(buffer) }
     }
 
+    #[inline(always)]
     pub fn get_memory_map(
         &self,
         map_size: *mut u64,
@@ -206,10 +207,9 @@ impl BootServices {
         Ok(ptr as *mut P)
     }
 
-    pub fn exit_boot_services(&self, handle: EfiHandle, map_key: u64) -> EfiStatus {
-        let func = self.exit_boot_services;
-
-        unsafe { func(handle, map_key) }
+    #[inline(always)]
+    pub extern "efiapi" fn exit_boot_services(&self, handle: EfiHandle, map_key: u64) -> EfiStatus {
+        unsafe { (self.exit_boot_services)(handle, map_key as usize) }
     }
 }
 
@@ -227,7 +227,7 @@ impl Display for EfiMemoryDescriptor {
     fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
         write!(
             f,
-            "Phys:{:X} | Virt: {:X} | {:?} | {}",
+            "{3:25} Phys: {0:#016X}   Virt: {1:#016X}   Pages: {2} ",
             self.physical_start,
             self.virtual_start,
             self.num_pages,

@@ -10,11 +10,12 @@ use crate::efi::alloc::EfiAllocator;
 use crate::efi::graphics::{GraphicsOutput, GRAPHICS_OUTPUT_GUID};
 use crate::efi::loaded_image::{LoadedImage, LOADED_IMAGE_GUID};
 use crate::efi::logger::EfiLogger;
-use crate::efi::simple_fs::{SimpleFileSystem, SIMPLE_FILE_SYSTEM_GUID};
+use crate::efi::simple_fs::{EfiFile, SimpleFileSystem, SIMPLE_FILE_SYSTEM_GUID};
 use crate::efi::SystemTable;
 use crate::efi::{
     format_efi_status, EfiHandle, EfiMemoryDescriptor, EfiMemoryType, EfiStatus, ALLOCATE_ANY_PAGES,
 };
+use alloc::fmt::format;
 use alloc::format;
 use alloc::string::ToString;
 use alloc::vec::Vec;
@@ -103,8 +104,7 @@ fn main(handle: EfiHandle, system_table: *const SystemTable) {
     //Load kernel data from /kernel.elf
     let kernel_data = load_kernel(handle, st).expect("Unable to load kernel");
     let kernel_file = ElfFile::from(kernel_data);
-
-    let data_sl = unsafe { slice::from_raw_parts(kernel_file.data(), kernel_file.len()) };
+    //let program_headers = kernel_file.program_headers();
 
     if !kernel_file.verify_magic() {
         panic!(
@@ -113,34 +113,51 @@ fn main(handle: EfiHandle, system_table: *const SystemTable) {
         )
     }
 
-    // //Load the main function into variable
-    // let kernel_main: unsafe extern fn(*const KernelArgs) = unsafe { mem::transmute(kernel_file.entry_point_ptr() as *const (*const KernelArgs)) };
-    //
-    // //Allocate kernel data and copy the file contents
-    // let kernel = allocate_kernel(st, kernel_file);
-    //
-    // //Prepare page table
-    // let page_table = init_page_table(&kernel);
-    //
-    // //Retrieve RSDP
-    // //TODO: Read RSDP
-    //
-    // let mut kargs = KernelArgs {
-    //     rsd_ptr: &0u8,
-    //     memory_map: &0u8,
-    //     memory_map_size: 0,
-    //     memory_map_type: 0,
-    //     framebuffer,
-    // };
-    //
-    // //We need the memory map for our kernel
-    // let (memory_map, map_key) = get_memory_map(st).unwrap();
-    //
+    //Load the main function into variable
+    let kernel_main: unsafe extern "C" fn(*const KernelArgs) =
+        unsafe { mem::transmute(kernel_file.entry_point_ptr() as *const (*const KernelArgs)) };
+
+    kernel_file
+        .program_headers()
+        .iter()
+        .filter(|h| h.header_type == 0x1)
+        .for_each(|h| {
+            let offset = h.offset;
+            let v_addr = h.v_addr;
+            let mem_size = h.memory_size;
+            logger.log(
+                format!(
+                    "Abs: {:#016X} - V: {:#016X} - {:8} Bytes\r\n",
+                    kernel_file.data() as u64 + offset,
+                    v_addr,
+                    mem_size
+                )
+                .as_str(),
+            );
+        });
+
+    //Prepare page table
+    //let page_table = init_page_table(&kernel_file);
+
+    //Retrieve RSDP
+    //TODO: Read RSDP
+
+    let mut kargs = KernelArgs {
+        rsd_ptr: &0u8,
+        memory_map: &0u8,
+        memory_map_size: 0,
+        memory_map_type: 0,
+        framebuffer,
+    };
+
+    //We need the memory map for our kernel
+    let (memory_map, map_key) = get_memory_map(handle, st).unwrap();
+
     // kargs.memory_map = memory_map.as_ptr() as *const u8;
     // kargs.memory_map_size = memory_map.len() as u64;
     // kargs.memory_map_type = MemoryMapType::UEFI;
     //
-    // logger.log(format!("Memory map is at: {:X}\r\n", kargs.memory_map as usize).as_str());
+    // logger.log(format!("Memory map is at: {:X} - Map Key is {:#X}\r\n", kargs.memory_map as usize, map_key).as_str());
     //
     // for i in 0..memory_map.len() {
     //     let entry = memory_map.get(i);
@@ -151,15 +168,15 @@ fn main(handle: EfiHandle, system_table: *const SystemTable) {
     //         logger.log(format!("{}\r\n", entry).as_str());
     //     }
     // }
-    //
-    // //Now we need to exit the UEFI boot services and call the kernel main to hand over control
-    // st.boot_services().exit_boot_services(handle, map_key);
-    //
-    // //Disable EFI Allocator as kernel will manage memory from now
-    // unsafe {
-    //     ALLOC = EfiAllocator::new(null());
-    //     LOGGER = None;
-    // }
+
+    //Disable EFI Allocator as kernel will manage memory from now
+    unsafe {
+        ALLOC = EfiAllocator::new(null());
+        LOGGER = None
+    }
+
+    //Write the kernel to 0x0 in physical memory
+    //allocate_kernel(&kernel_file, &program_headers);
 
     //Set page table
     // unsafe {
@@ -179,9 +196,10 @@ fn main(handle: EfiHandle, system_table: *const SystemTable) {
     //     in(reg) kernel_main);
     // }
     // OPTION 2:
-    // unsafe {
-    //     kernel_main(&kargs);
-    // }
+    unsafe {
+        //logger.log("Passing control to kernel");
+        //kernel_main(&kargs);
+    }
     loop {}
 }
 
@@ -234,81 +252,45 @@ pub fn load_kernel(handle: EfiHandle, st: &SystemTable) -> Result<Vec<u8>, EfiSt
     buffer.resize(file_size as usize, 0);
     let mut buffer_size = buffer.capacity();
 
-    logger.log(format!("Buffer size: {}\r\n", buffer_size).as_str());
-
     unsafe {
         let status = (*file).read_chunked(256, &mut buffer);
 
-        logger.log(format!("Buffer: {:X?}\r\n", &buffer.as_slice()[0..4]).as_str());
-
         if status == 0 {
-            logger.log(
-                format!(
-                    "File read bytes: {:?} Revision: {:?} Size: {:?}\r\n",
-                    buffer_size,
-                    (*file).revision,
-                    file_size
-                )
-                .as_str(),
-            );
             Ok(buffer)
         } else {
-            logger.log("File: ERR\r\n");
             Err(status)
         }
     }
 }
 
 #[allow(unsafe_code)]
-pub fn allocate_kernel(st: &SystemTable, file: ElfFile) -> KernelElf {
-    let headers = file.program_headers();
-    let mut loadable_headers = Vec::new();
-    let mut len = 0u64;
-
-    for header in headers {
-        if header.header_type != 0x1 {
-            continue;
-        }
-
-        if header.align != 0x1000 {
-            panic!("Invalid alignment for program segment")
-        }
-
-        len += header.memory_size;
-
-        loadable_headers.push(header);
-    }
-
-    let mut start_address = 0u64;
-    st.boot_services().allocate_pages(
-        ALLOCATE_ANY_PAGES,
-        EfiMemoryType::EFI_LOADER_DATA,
-        len,
-        &mut start_address,
-    );
-
-    //Copy file contents
+pub fn allocate_kernel(file: &ElfFile, headers: &[ProgramHeader]) {
+    let logger = unsafe { &mut *LOGGER.unwrap() };
     let file_data = unsafe { slice::from_raw_parts(file.data(), file.len()) };
-    let memory_data = unsafe {
-        slice::from_raw_parts_mut(start_address as *mut u8, loadable_headers.len() * 0x1000)
-    };
 
-    for header in &loadable_headers {
-        for i in 0..header.file_size {
-            let memory_offset = (header.v_addr + i) as usize;
-            let file_offset = (header.offset + i) as usize;
-            memory_data[memory_offset] = file_data[file_offset];
-        }
-    }
+    //Copy the kernel file to start of physical memory
+    for header in headers {
+        // let start = header.v_addr as usize;
+        // let mut ptr = start as *mut u8;
+        // let start_file = header.offset as usize;
+        // let len = start_file + header.memory_size as usize;
 
-    KernelElf {
-        loadable_headers,
-        start_address,
+        // logger.log(format!("Copy file {:#016X} to memory {:#016X}", start_file, start).as_str());
+        //
+        // for i in start_file..len {
+        //     unsafe {
+        //         *ptr = file_data[i];
+        //         ptr = ptr.add(1);
+        //     }
+        // }
     }
 }
 
 #[allow(unsafe_code)]
-pub fn get_memory_map(st: &SystemTable) -> Result<(Vec<EfiMemoryDescriptor>, u64), EfiStatus> {
+pub fn get_memory_map(
+    handle: EfiHandle,
+    st: &SystemTable,
+) -> Result<(Vec<EfiMemoryDescriptor>, u64), EfiStatus> {
     let mut bytes: Vec<u8> = Vec::new();
     let mut map_size_bytes = 0u64;
     let mut map_key = 0u64;
@@ -326,17 +308,6 @@ pub fn get_memory_map(st: &SystemTable) -> Result<(Vec<EfiMemoryDescriptor>, u64
     map_size_bytes += 2 * desc_size;
     bytes.resize(map_size_bytes as usize, 0);
 
-    unsafe {
-        (*LOGGER.unwrap()).log(
-            format!(
-                "Descriptor Size: {} / size_of: {}\r\n",
-                desc_size,
-                size_of::<EfiMemoryDescriptor>()
-            )
-            .as_str(),
-        );
-    }
-
     let map_len = map_size_bytes / desc_size;
     let mut map = Vec::with_capacity(map_len as usize);
 
@@ -348,28 +319,36 @@ pub fn get_memory_map(st: &SystemTable) -> Result<(Vec<EfiMemoryDescriptor>, u64
         &mut desc_version,
     );
 
-    unsafe {
-        for i in 0..map_len as usize {
-            let pos = i * desc_size as usize;
-            let pos_end = pos + desc_size as usize;
-            let data = &bytes[pos..pos_end];
+    //Now we need to exit the UEFI boot services and call the kernel main to hand over control
+    let exit_status = st.boot_services().exit_boot_services(handle, map_key);
+    unsafe { (*LOGGER.unwrap()).log(format!("Exit Status: {}", exit_status).as_str()) }
+    // if exit_status != 0 {
+    //     return Err(exit_status);
+    // }
 
-            let descriptor = data.as_ptr() as *const EfiMemoryDescriptor;
-            let descriptor_ref = &*descriptor;
-
-            //(*LOGGER.unwrap()).log(format!("D! {}\r\n", *descriptor).as_str());
-
-            map.push(*descriptor_ref);
-            //(*LOGGER.unwrap()).log(format!("D3! {}\r\n", map.get(i).unwrap()).as_str());
-        }
-    }
+    // unsafe {
+    //     for i in 0..map_len as usize {
+    //         let pos = i * desc_size as usize;
+    //         let pos_end = pos + desc_size as usize;
+    //         let data = &bytes[pos..pos_end];
+    //
+    //         let descriptor = data.as_ptr() as *const EfiMemoryDescriptor;
+    //         let descriptor_ref = &*descriptor;
+    //
+    //         //(*LOGGER.unwrap()).log(format!("D! {}\r\n", *descriptor).as_str());
+    //
+    //         map.push(*descriptor_ref);
+    //         //(*LOGGER.unwrap()).log(format!("D3! {}\r\n", map.get(i).unwrap()).as_str());
+    //     }
+    // }
 
     return Ok((map, map_key));
 }
 
 #[allow(unsafe_code)]
-pub fn init_page_table(kernel: &KernelElf) -> Vec<PageMapTable> {
-    let mut page_maps: Vec<PageMapTable> = Vec::with_capacity(512 + 512 + 512 + 512);
+pub fn init_page_table(kernel: &ElfFile) -> Vec<PageMapTable> {
+    let mut page_maps: Vec<PageMapTable> = Vec::new();
+    page_maps.resize(512 + 512 + 512 + 512, PageMapTable::from(0u64));
     let pdp_ptr = page_maps.get(512).unwrap() as *const _ as u64;
     let pd_ptr = page_maps.get(1024).unwrap() as *const _ as u64;
     let pt_ptr = page_maps.get(1536).unwrap() as *const _ as u64;
@@ -401,9 +380,16 @@ pub fn init_page_table(kernel: &KernelElf) -> Vec<PageMapTable> {
             .into(),
     );
 
+    let loadable_headers: Vec<ProgramHeader> = kernel
+        .program_headers()
+        .iter()
+        .filter(|hdr| hdr.header_type == 0x1 && hdr.align == 0x1000)
+        .cloned()
+        .collect();
+
     //Page Table
     //This only prepares a basic page table containing the kernel only
-    for header in &kernel.loadable_headers {
+    for header in loadable_headers {
         let pages = if header.memory_size % 0x1000 == 0 {
             header.memory_size / 0x1000
         } else {
