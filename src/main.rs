@@ -183,6 +183,8 @@ fn main(handle: EfiHandle, system_table: *const SystemTable) -> u64 {
     //Write the kernel to 0x0 in physical memory
     allocate_kernel(&kernel_file, &headers);
 
+    writeln!(logger, "Allocated kernel").unwrap();
+
     //Set page table
     // unsafe {
     //     asm!("mov rax, {}",
@@ -195,7 +197,7 @@ fn main(handle: EfiHandle, system_table: *const SystemTable) -> u64 {
         unsafe { mem::transmute(kernel_file.entry_point_ptr() as *const (*const KernelArgs)) };
 
     unsafe {
-        //logger.log("Passing control to kernel");
+        writeln!(logger, "Calling kernel").unwrap();
         let returnval = kernel_main(kargs.as_ref());
         writeln!(logger, "Kernel returned: {:X}\r", returnval).unwrap();
     }
