@@ -13,6 +13,7 @@ use crate::efi::logger::EfiLogger;
 use crate::efi::simple_fs::{EfiFile, SimpleFileSystem, SIMPLE_FILE_SYSTEM_GUID};
 use crate::efi::SystemTable;
 use crate::efi::{format_efi_status, EfiHandle, EfiMemoryDescriptor, EfiStatus};
+use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::ToString;
 use alloc::vec::Vec;
@@ -114,10 +115,6 @@ fn main(handle: EfiHandle, system_table: *const SystemTable) -> u64 {
         )
     }
 
-    //Load the main function into variable
-    let kernel_main: unsafe extern "C" fn(*const KernelArgs) -> u64 =
-        unsafe { mem::transmute(kernel_file.entry_point_ptr() as *const (*const KernelArgs)) };
-
     kernel_file
         .program_headers()
         .iter()
@@ -144,13 +141,13 @@ fn main(handle: EfiHandle, system_table: *const SystemTable) -> u64 {
     //Retrieve RSDP
     //TODO: Read RSDP
 
-    let mut kargs = KernelArgs {
+    let mut kargs = Box::new(KernelArgs {
         rsd_ptr: &0u8,
         memory_map: &0u8,
         memory_map_size: 0,
         memory_map_type: 0,
         framebuffer,
-    };
+    });
 
     //We need the memory map for our kernel
     let memory_map = exit_boot_services(handle, st).unwrap();
@@ -179,7 +176,7 @@ fn main(handle: EfiHandle, system_table: *const SystemTable) -> u64 {
     writeln!(
         logger,
         "KArgs address: {:X}\r",
-        &kargs as *const KernelArgs as u64
+        kargs.as_ref() as *const KernelArgs as u64
     )
     .unwrap();
 
@@ -193,9 +190,13 @@ fn main(handle: EfiHandle, system_table: *const SystemTable) -> u64 {
     //         in(reg) page_table.as_ptr());
     // }
 
+    //Load the main function into variable
+    let kernel_main: unsafe extern "sysv64" fn(*const KernelArgs) -> u64 =
+        unsafe { mem::transmute(kernel_file.entry_point_ptr() as *const (*const KernelArgs)) };
+
     unsafe {
         //logger.log("Passing control to kernel");
-        let returnval = kernel_main(&kargs as *const KernelArgs);
+        let returnval = kernel_main(kargs.as_ref());
         writeln!(logger, "Kernel returned: {:X}\r", returnval).unwrap();
     }
     loop {}
@@ -206,7 +207,7 @@ pub fn load_kernel(handle: EfiHandle, st: &SystemTable) -> Result<Vec<u8>, EfiSt
     let mut logger = unsafe { &mut *LOGGER.unwrap() };
     //logger.log("NightOS Bootloader (v0.0.1)\r\n");
 
-    //logger.log("Loading kernel from /kernel.elf\r\n");
+    //logger.log("Loading kernel from /kernel\r\n");
     let loaded_image_result =
         st.boot_services()
             .open_protocol::<LoadedImage>(handle, LOADED_IMAGE_GUID, handle);
@@ -239,11 +240,7 @@ pub fn load_kernel(handle: EfiHandle, st: &SystemTable) -> Result<Vec<u8>, EfiSt
             .expect("Unable to open volume due to error")
     };
 
-    let file = unsafe {
-        (*root)
-            .open("kernel.elf", 1, 0)
-            .expect("Unable to open file")
-    };
+    let file = unsafe { (*root).open("kernel", 1, 0).expect("Unable to open file") };
     let file_size = unsafe { (*file).file_size() };
 
     let mut buffer: Vec<u8> = Vec::new();
