@@ -10,20 +10,19 @@ use crate::efi::alloc::EfiAllocator;
 use crate::efi::graphics::{GraphicsOutput, GRAPHICS_OUTPUT_GUID};
 use crate::efi::loaded_image::{LoadedImage, LOADED_IMAGE_GUID};
 use crate::efi::logger::EfiLogger;
-use crate::efi::simple_fs::{EfiFile, SimpleFileSystem, SIMPLE_FILE_SYSTEM_GUID};
+use crate::efi::simple_fs::{SimpleFileSystem, SIMPLE_FILE_SYSTEM_GUID};
 use crate::efi::SystemTable;
 use crate::efi::{format_efi_status, EfiHandle, EfiMemoryDescriptor, EfiStatus};
 use alloc::boxed::Box;
-use alloc::format;
 use alloc::string::ToString;
 use alloc::vec::Vec;
 use core::arch::asm;
 use core::fmt::{Debug, Write};
-use core::mem::{align_of, size_of};
+use core::ops::Add;
 use core::panic::PanicInfo;
-use core::ptr::{null, null_mut};
+use core::ptr::null;
 use core::{mem, slice};
-use elf_loader::{ElfFile, ProgramHeader};
+use elf_loader::{ElfFile, ProgramHeader, RelocationSection};
 
 mod common;
 mod efi;
@@ -48,50 +47,57 @@ fn main(handle: EfiHandle, system_table: *const SystemTable) -> u64 {
 
     let st = SystemTable::from_ptr(system_table);
 
-    //Get the handles for the Graphics Output Protocol for the logger
-    let graphics_handle_result = st
-        .boot_services()
-        .locate_handle_for_protocol(&GRAPHICS_OUTPUT_GUID);
-    if graphics_handle_result.is_err() {
-        let _ = writeln!(
-            st.stdout(),
-            "Unable to locate graphics handle: {}",
-            format_efi_status(graphics_handle_result.unwrap_err())
+    ////////////////////////////////////////////////////////////////////////////////////////////////
+    // Step 1: Prepare logger                                                                     //
+    ////////////////////////////////////////////////////////////////////////////////////////////////
+    let (framebuffer, mut logger) = {
+        //Get the handles for the Graphics Output Protocol for the logger
+        let graphics_handle_result = st
+            .boot_services()
+            .locate_handle_for_protocol(&GRAPHICS_OUTPUT_GUID);
+        if graphics_handle_result.is_err() {
+            let _ = writeln!(
+                st.stdout(),
+                "Unable to locate graphics handle: {}",
+                format_efi_status(graphics_handle_result.unwrap_err())
+            );
+            panic!();
+        }
+
+        let graphics_handle = graphics_handle_result.unwrap();
+
+        let g_result = st.boot_services().open_protocol::<GraphicsOutput>(
+            graphics_handle,
+            GRAPHICS_OUTPUT_GUID,
+            handle,
         );
-        panic!();
-    }
+        if g_result.is_err() {
+            let _ = writeln!(
+                st.stdout(),
+                "Unable to load graphics protocol: {}",
+                format_efi_status(g_result.unwrap_err())
+            );
+            panic!();
+        }
 
-    let graphics_handle = graphics_handle_result.unwrap();
+        let g = unsafe { &*g_result.unwrap() };
+        let mode = g.mode();
+        let mode_info = mode.current_mode();
 
-    let g_result = st.boot_services().open_protocol::<GraphicsOutput>(
-        graphics_handle,
-        GRAPHICS_OUTPUT_GUID,
-        handle,
-    );
-    if g_result.is_err() {
-        let _ = writeln!(
-            st.stdout(),
-            "Unable to load graphics protocol: {}",
-            format_efi_status(g_result.unwrap_err())
-        );
-        panic!();
-    }
+        //Save the framebuffer data so we can use it in kernel later and access logger
+        let framebuffer = FrameBufferInfo {
+            address: mode.framebuffer as usize,
+            len: mode.framebuffer_len as usize,
+            screen_width: mode_info.horizontal_resolution,
+            screen_height: mode_info.vertical_resolution,
+            pixels_per_scan_line: mode_info.pixels_per_scan_line,
+        };
 
-    let g = unsafe { &*g_result.unwrap() };
-    let mode = g.mode();
-    let mode_info = mode.current_mode();
+        let mut fb = FrameBuffer::new(framebuffer.clone());
+        let mut logger = EfiLogger::new(fb.clone());
 
-    //Save the framebuffer data so we can use it in kernel later and access logger
-    let framebuffer = FrameBufferInfo {
-        address: mode.framebuffer as usize,
-        len: mode.framebuffer_len as usize,
-        screen_width: mode_info.horizontal_resolution,
-        screen_height: mode_info.vertical_resolution,
-        pixels_per_scan_line: mode_info.pixels_per_scan_line,
+        (framebuffer, logger)
     };
-
-    let mut fb = FrameBuffer::new(framebuffer.clone());
-    let mut logger = EfiLogger::new(fb.clone());
 
     unsafe {
         LOGGER = Some(&mut logger);
@@ -99,19 +105,21 @@ fn main(handle: EfiHandle, system_table: *const SystemTable) -> u64 {
 
     writeln!(
         logger,
-        "EfiLogger initialized, using framebuffer at {:X}\r",
-        framebuffer.address
+        "EfiLogger initialized, using framebuffer at {:X}, len {:X}\r",
+        framebuffer.address, framebuffer.len
     )
     .unwrap();
-    //Load kernel data from /kernel.elf
-    let kernel_data = load_kernel(handle, st).expect("Unable to load kernel");
-    let kernel_file = ElfFile::from(kernel_data);
-    //let program_headers = kernel_file.program_headers();
 
-    if !kernel_file.verify_magic() {
+    ////////////////////////////////////////////////////////////////////////////////////////////////
+    // Step 2: Load kernel into memory                                                            //
+    ////////////////////////////////////////////////////////////////////////////////////////////////
+    let mut kernel_data = load_kernel(handle, st).expect("Unable to load kernel");
+    let kernel_file = ElfFile::read(kernel_data.as_mut_slice());
+
+    if !kernel_file.is_valid() {
         panic!(
             "Can not load kernel: File is corrupted, it is not of type ELF\r\nKernel Length: {:?}",
-            kernel_file.len()
+            kernel_file.data().len()
         )
     }
 
@@ -126,14 +134,13 @@ fn main(handle: EfiHandle, system_table: *const SystemTable) -> u64 {
             writeln!(
                 logger,
                 "Abs: {:#016X} - V: {:#016X} - {:8} Bytes\r",
-                kernel_file.data() as u64 + offset,
+                kernel_file.data().as_ptr() as u64 + offset,
                 v_addr,
                 mem_size
             )
             .unwrap();
         });
-
-    let headers = kernel_file.program_headers();
+    let kernel_len = kernel_file.load_segments_len();
 
     //Prepare page table
     //let page_table = init_page_table(&kernel_file);
@@ -142,6 +149,8 @@ fn main(handle: EfiHandle, system_table: *const SystemTable) -> u64 {
     //TODO: Read RSDP
 
     let mut kargs = Box::new(KernelArgs {
+        kernel_ptr: 0x100000 as *const u8,
+        kernel_len: 0,
         rsd_ptr: &0u8,
         memory_map: &0u8,
         memory_map_size: 0,
@@ -149,7 +158,20 @@ fn main(handle: EfiHandle, system_table: *const SystemTable) -> u64 {
         framebuffer,
     });
 
-    //We need the memory map for our kernel
+    ////////////////////////////////////////////////////////////////////////////////////////////////
+    // Step 3: Prepare stack                                                                      //
+    ////////////////////////////////////////////////////////////////////////////////////////////////
+    let stack_size: usize = 128 * 1024;
+    let mut stack: Vec<u8> = Vec::new();
+    stack.resize(stack_size, 0);
+    let stack_ptr = stack.as_ptr() as usize + stack_size;
+
+    //Prepare identity paging
+    //let page_tables = identity_paging();
+
+    ////////////////////////////////////////////////////////////////////////////////////////////////
+    // Step 4: Exit the boot services and get memory map                                          //
+    ////////////////////////////////////////////////////////////////////////////////////////////////
     let memory_map = exit_boot_services(handle, st).unwrap();
 
     kargs.memory_map = memory_map.as_ptr() as *const u8;
@@ -180,28 +202,42 @@ fn main(handle: EfiHandle, system_table: *const SystemTable) -> u64 {
     )
     .unwrap();
 
-    //Write the kernel to 0x0 in physical memory
-    allocate_kernel(&kernel_file, &headers);
+    ////////////////////////////////////////////////////////////////////////////////////////////////
+    // Step 5: Copy the kernel to 0x100000 static location and apply relocations                  //
+    ////////////////////////////////////////////////////////////////////////////////////////////////
+    writeln!(logger, "Allocating kernel: {}\r", kernel_len).unwrap();
+    //Write the kernel to 0x100000 in physical memory
+    let memory_location = unsafe { slice::from_raw_parts_mut(0x100000 as *mut u8, kernel_len) };
+    kernel_file.load(memory_location);
+    kernel_file.relocate(memory_location);
 
-    writeln!(logger, "Allocated kernel").unwrap();
-
-    //Set page table
-    // unsafe {
-    //     asm!("mov rax, {}",
-    //         "mov cr3, rax",
-    //         in(reg) page_table.as_ptr());
-    // }
-
+    ////////////////////////////////////////////////////////////////////////////////////////////////
+    // Step 1: Call the kernel                                                                    //
+    ////////////////////////////////////////////////////////////////////////////////////////////////
     //Load the main function into variable
-    let kernel_main: unsafe extern "sysv64" fn(*const KernelArgs) -> u64 =
-        unsafe { mem::transmute(kernel_file.entry_point_ptr() as *const (*const KernelArgs)) };
+    let kernel_main: unsafe extern "sysv64" fn(*const KernelArgs) -> ! =
+        unsafe { mem::transmute(memory_location.as_ptr().add(kernel_file.entrypoint())) };
 
     unsafe {
-        writeln!(logger, "Calling kernel").unwrap();
-        let returnval = kernel_main(kargs.as_ref());
-        writeln!(logger, "Kernel returned: {:X}\r", returnval).unwrap();
+        writeln!(logger, "Calling kernel\r").unwrap();
+
+        //asm!("mov cr3, {}", in(reg) (page_tables.as_ptr() as u64) << 12);
+
+        call_kernel(kernel_main, stack_ptr, kargs.as_ref())
+        //writeln!(logger, "Kernel returned: {:X}\r", returnval).unwrap();
     }
     loop {}
+}
+
+#[allow(unsafe_code)]
+pub unsafe fn call_kernel(
+    kmain: unsafe extern "sysv64" fn(*const KernelArgs) -> !,
+    stack_ptr: usize,
+    args: &KernelArgs,
+) -> ! {
+    asm!("mov rsp, {}", in(reg) stack_ptr);
+
+    kmain(args);
 }
 
 #[allow(unsafe_code)]
@@ -257,34 +293,6 @@ pub fn load_kernel(handle: EfiHandle, st: &SystemTable) -> Result<Vec<u8>, EfiSt
         } else {
             Err(status)
         }
-    }
-}
-
-#[allow(unsafe_code)]
-pub fn allocate_kernel(file: &ElfFile, headers: &[ProgramHeader]) {
-    let logger = logger();
-    let file_data = unsafe { slice::from_raw_parts(file.data(), file.len()) };
-
-    //Copy the kernel file to start of physical memory
-    for header in headers {
-        let start = header.v_addr as usize;
-
-        let mut ptr = start as *mut u8;
-        let start_file = header.offset as usize;
-        let end_file = start_file + header.memory_size as usize;
-
-        //writeln!(logger, "Copy file {:#016X} to memory {:#016X}\r", start_file, start).unwrap();
-
-        for i in start_file..end_file {
-            unsafe {
-                *ptr = file_data[i];
-                ptr = ptr.add(1);
-            }
-        }
-
-        ptr = start as *mut u8;
-
-        //unsafe { writeln!(logger, "File {:#016X} = Memory {:#016X}\r", file_data[start_file], *ptr).unwrap(); }
     }
 }
 
@@ -353,84 +361,36 @@ pub fn exit_boot_services(
 }
 
 #[allow(unsafe_code)]
-pub fn init_page_table(kernel: &ElfFile) -> Vec<PageMapTable> {
-    let mut page_maps: Vec<PageMapTable> = Vec::new();
-    page_maps.resize(512 + 512 + 512 + 512, PageMapTable::from(0u64));
-    let pdp_ptr = page_maps.get(512).unwrap() as *const _ as u64;
-    let pd_ptr = page_maps.get(1024).unwrap() as *const _ as u64;
-    let pt_ptr = page_maps.get(1536).unwrap() as *const _ as u64;
+pub fn identity_paging() -> Vec<u64> {
+    let mut page_table = Vec::new();
+    page_table.resize(2048, 0);
 
-    //PML4
-    page_maps.insert(
-        0,
-        PageMapTableBuilder::from(0u64)
-            .address(pdp_ptr)
-            .present(true)
-            .into(),
-    );
-
-    //PDP
-    page_maps.insert(
-        512,
-        PageMapTableBuilder::from(0u64)
-            .address(pd_ptr)
-            .present(true)
-            .into(),
-    );
-
-    //Page Directory
-    page_maps.insert(
-        1024,
-        PageMapTableBuilder::from(0u64)
-            .address(pt_ptr)
-            .present(true)
-            .into(),
-    );
-
-    let loadable_headers: Vec<ProgramHeader> = kernel
-        .program_headers()
-        .iter()
-        .filter(|hdr| hdr.header_type == 0x1 && hdr.align == 0x1000)
-        .cloned()
-        .collect();
-
-    //Page Table
-    //This only prepares a basic page table containing the kernel only
-    for header in loadable_headers {
-        let pages = if header.memory_size % 0x1000 == 0 {
-            header.memory_size / 0x1000
-        } else {
-            header.memory_size / 0x1000 + 1
-        };
-
-        // Pages are 4 KB in size, so we need to convert v_addr into page index
-        let page_start = header.v_addr / 4096;
-
-        for page in 0..pages {
-            page_maps.insert(
-                (1536 + page_start + page) as usize,
-                PageMapTableBuilder::from(0u64)
-                    .address(header.p_addr + page * 0x1000)
-                    .present(true)
-                    .into(),
-            );
-        }
+    let mut address_pdp = 0;
+    unsafe {
+        address_pdp = page_table.as_ptr().add(1024) as u64;
     }
 
-    //Add the page table itself to the end of the page table
-    for i in 0..4 {
-        unsafe {
-            page_maps.insert(
-                2043 + i,
-                PageMapTableBuilder::from(0u64)
-                    .address(page_maps.as_ptr().add(i * 8 * 512) as u64)
-                    .present(true)
-                    .into(),
-            );
-        }
+    let pml4_entry: u64 = PageMapTableBuilder::from(0)
+        .address(address_pdp)
+        .present(true)
+        .into();
+
+    let mut page = page_table.get_mut(0).unwrap();
+    *page = pml4_entry;
+
+    for i in 0..8usize {
+        let entry: u64 = PageMapTableBuilder::from(0)
+            .address((i * 1024 * 1024 * 1024) as u64)
+            .execute_disable(false)
+            .page_size(true)
+            .present(true)
+            .into();
+
+        let mut page = page_table.get_mut(1024 + i).unwrap();
+        *page = entry;
     }
 
-    page_maps
+    page_table
 }
 
 #[allow(unsafe_code)]
@@ -452,10 +412,15 @@ impl MemoryMapType {
 
 #[repr(C)]
 pub struct KernelArgs {
+    kernel_ptr: *const u8,
+    kernel_len: u64,
+
     rsd_ptr: *const u8,
+
     memory_map: *const u8,
     memory_map_size: u64,
     memory_map_type: u8,
+
     framebuffer: FrameBufferInfo,
 }
 

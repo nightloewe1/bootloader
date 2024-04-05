@@ -161,3 +161,9 @@ impl From<u64> for PageMapTableBuilder {
         PageMapTableBuilder(value)
     }
 }
+
+impl From<PageMapTableBuilder> for u64 {
+    fn from(value: PageMapTableBuilder) -> Self {
+        value.0
+    }
+}
